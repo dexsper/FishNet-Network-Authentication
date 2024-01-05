@@ -18,178 +18,194 @@ namespace NetworkAuth.ServerAuth
     [DisallowMultipleComponent]
     public class ServerAuthenticator : Authenticator
     {
-        #region Private
-        private bool HandshakeCompleted = false;
-        private NetworkManager manager = null;
-        private Encryptor crypto = null;
-        #endregion
+        private readonly Dictionary<int, bool> _handshakeCompleted = new();
+        private NetworkManager _manager;
+        private Encryptor _crypto;
+        private Server.Server _server;
 
-        #region Public.
-        /// <summary>
-        /// Called when authenticator has concluded a result for a connection. Boolean is true if authenticated successfully, false if failed.
-        /// Server listens for this event automatically.
-        /// </summary>
         public override event Action<NetworkConnection, bool> OnAuthenticationResult;
-        #endregion
-
-        #region Serialized, Authentication Data.
-        /// <summary>
-        /// Client Username to authenticate.
-        /// </summary>
-        //You can use this fields or modify the OnAuthenticationRequestBroadcast
-        //In next versions thre will be a rework for managing those fields. 
-        [Tooltip("Client Username to authenticate.")]
-        [SerializeField]
-        private string _username = "HelloWorld";
-        /// <summary>
-        /// Client Password to authenticate.
-        /// </summary>
-        [Tooltip("Client Password to authenticate.")]
-        [SerializeField]
-        private string _password = "HelloWorld";
-
-        /// <summary>
-        /// The Client Username that will be authenticated.
-        /// </summary>
-        public string Username
-        {
-            set
-            {
-                _username = value;
-            }
-        }
-
-        /// <summary>
-        /// The Client Password that will be authenticated.
-        /// </summary>
-        public string Password
-        {
-            set
-            {
-                _password = value;
-            }
-        }
-        #endregion
 
         public override void InitializeOnce(NetworkManager networkManager)
         {
             base.InitializeOnce(networkManager);
-            manager = networkManager;
-            //Listen for connection state change as Server.
-            manager.ServerManager.OnServerConnectionState += OnServerConnectionState;
+
+            _manager = networkManager;
+            _server = _manager.GetComponent<Server.Server>();
+            _manager.ServerManager.OnServerConnectionState += OnServerConnectionState;
+            _manager.ServerManager.OnRemoteConnectionState += OnRemoteConnectionState;
         }
 
-        private void OnServerConnectionState(ServerConnectionStateArgs serverargs)
+        private void OnRemoteConnectionState(NetworkConnection conn, RemoteConnectionStateArgs args)
         {
-            if (serverargs.ConnectionState == LocalConnectionState.Started)
+            if (args.ConnectionState != RemoteConnectionState.Stopped)
+                return;
+
+            if (_handshakeCompleted.ContainsKey(conn.ClientId))
             {
-                //Using static parameters for P and G of Diffie-Hellman algoritm.
-                //cause they are strong enough and if changed need to be the same as the client.
-                //See CryptoDataTransforms.cs for some P parameters you can choose.
-                crypto = new Encryptor(12, 6);
-                //Listen for handshake broadcast from client.
-                manager.ServerManager.RegisterBroadcast<HandshakeRequestBroadcast>(OnHandshakeRequestBroadcast, false);
-                manager.Log("Listening for Handshake request...");
-                //Listen for AuthenticationRequest broadcast from client.
-                manager.ServerManager.RegisterBroadcast<AuthenticationRequestBroadcast>(OnAuthenticationRequestBroadcast, false);
-                manager.Log("Listening for Authentication request...");
+                _handshakeCompleted[conn.ClientId] = false;
             }
-            if (serverargs.ConnectionState == LocalConnectionState.Stopped)
-            {
-                manager.ServerManager.UnregisterBroadcast<HandshakeRequestBroadcast>(OnHandshakeRequestBroadcast);
-                manager.Log("Stopped Listening for Handshake request...");
-                manager.ServerManager.UnregisterBroadcast<AuthenticationRequestBroadcast>(OnAuthenticationRequestBroadcast);
-                manager.Log("Stopped Listening for Authentication request...");
-            }
-        }
-        /// <summary>
-        /// Received on server when a client sends the HandshakeRequest broadcast message.
-        /// </summary>
-        /// <see cref="https://en.wikipedia.org/wiki/Diffie-Hellman_key_exchange"/>
-        /// <param name="conn">Connection sending broadcast.</param>
-        /// <param name="hsk">The Public key of the client in order to compute a common key.</param>
-        /// 
-        private void OnHandshakeRequestBroadcast(NetworkConnection conn, HandshakeRequestBroadcast hsk, Channel channel)
-        {
-            NetworkManager.Log("Received Handshake request from client...");
-            Span<byte> result = stackalloc byte[64 + 16];
-            byte[] data = new byte[64 + 16];
-            result.Clear();
-            //Compute the common private key based on the public key received.
-            NetworkManager.Log("Computing the SharedKey key based on the public key received from client...");
-            crypto.ComputeShared(Transforms.InvertTransformValueArray(hsk.PublicKey).ToArray());
-            //Mark the handshake as completed.
-            HandshakeCompleted = true;
-            /* Send a HandshakeResponse broadcast message to client with the server
-             * public key so the client can also compute the common private key
-             * and use it for encrypted communication with the server.*/
-            NetworkManager.Log("Sending Server Public Key as a response to the handshake request from client...");
-            Array.ConstrainedCopy(crypto.GetRandomSalt(), 0, data, 0, 64);
-            Array.ConstrainedCopy(crypto.GetIV(), 0, data, 64, 16);
-            result = new Span<byte>(data);
-            HandshakeResponseBroadcast hrb = new()
-            {
-                PublicKey = Transforms.TransformValueArray(crypto.PublicKey).ToArray(),
-                Randombytes = Transforms.TransformValueArray(result.ToArray()).ToArray()
-            };
-            SendHandshakeResponse(conn, hrb);
-            Array.Clear(data,0, data.Length);
         }
 
-        /// <summary>
-        /// Received on server when a client sends the AuthenticationRequest broadcast message.
-        /// </summary>
-        /// <param name="conn">Connection sending broadcast.</param>
-        /// <param name="arb">The client login details for authentication.</param>
-        private void OnAuthenticationRequestBroadcast(NetworkConnection conn, AuthenticationRequestBroadcast arb, Channel channel)
+        private void OnServerConnectionState(ServerConnectionStateArgs args)
         {
-            //We can't begin an authentication session if the client and server haven't agreed
-            //on a SharedKey key for the encryption of the transmited data.
-            if (!HandshakeCompleted)
+            switch (args.ConnectionState)
+            {
+                case LocalConnectionState.Started:
+                    _crypto = new Encryptor(12, 6);
+
+                    _manager.ServerManager.RegisterBroadcast<HandshakeRequestBroadcast>(OnHandshakeRequestBroadcast,
+                        false);
+                    _manager.ServerManager.RegisterBroadcast<AuthenticationRequestBroadcast>(
+                        OnAuthenticationRequestBroadcast, false);
+                    _manager.ServerManager.RegisterBroadcast<RegisterRequestBroadcast>(
+                        OnRegisterRequestBroadcast, false);
+
+                    _manager.Log("Listening for Handshake requests...");
+                    _manager.Log("Listening for Authentication requests...");
+                    _manager.Log("Listening for Register requests..");
+                    break;
+                case LocalConnectionState.Stopped:
+                    _manager.ServerManager.UnregisterBroadcast<HandshakeRequestBroadcast>(OnHandshakeRequestBroadcast);
+                    _manager.Log("Stopped Listening for Handshake request...");
+                    _manager.ServerManager.UnregisterBroadcast<AuthenticationRequestBroadcast>(
+                        OnAuthenticationRequestBroadcast);
+                    _manager.Log("Stopped Listening for Authentication request...");
+                    break;
+            }
+        }
+
+        private async void OnRegisterRequestBroadcast(NetworkConnection conn, RegisterRequestBroadcast rrb,
+            Channel channel)
+        {
+            if (!_handshakeCompleted.TryGetValue(conn.ClientId, out bool handshakeCompleted) || !handshakeCompleted)
             {
                 NetworkManager.LogWarning("A Client tried to authenticate without previously completing handshaking.");
                 return;
             }
 
-            /* If client is already authenticated this could be an attack. Connections
-             * are removed when a client disconnects so there is no reason they should
-             * already be considered authenticated. */
             if (conn.Authenticated)
             {
                 conn.Disconnect(true);
                 NetworkManager.LogWarning("Client Disconnected. Reason: Already Authenticated.");
                 return;
             }
-            //Check Here the actual user details from your database,playfab, etc.
-            //and decide whether to allow the user to login or not.
-            //Fill _username and _password fields with your real data.
-            NetworkManager.Log("Validating client details...");
-            bool ValidUsername = Encoding.UTF8.GetString(crypto.DecryptData(arb.Username, arb.usr_pad_count)) == _username;
-            bool ValidPassword = Encoding.UTF8.GetString(crypto.DecryptData(arb.Password, arb.pass_pad_count)) == _password;
-            bool result = (ValidUsername && ValidPassword);
-            SendAuthenticationResponse(conn, result);
-            OnAuthenticationResult?.Invoke(conn, result);
-        }
 
-        /// <summary>
-        /// Sends an authentication result to a connection.
-        /// </summary>
-        private void SendAuthenticationResponse(NetworkConnection conn, bool _authenticated)
-        {
-            NetworkManager.Log("Sending Authentication response to client...");
-            AuthenticationResponseBroadcast arb = new()
+            NetworkManager.Log("Try register client account.");
+
+            string username = Encoding.UTF8.GetString(_crypto.DecryptData(rrb.Username, rrb.usr_pad_count));
+            string password = Encoding.UTF8.GetString(_crypto.DecryptData(rrb.Username, rrb.pass_pad_count));
+            string email = rrb.Email;
+            bool registered = false;
+
+            Account existsAccount =
+                await _server.Database.FindAsync<Account>(x => x.Email == email || x.Username == username);
+
+            if (existsAccount == null)
             {
-                Authenticated = _authenticated
+                Hash.CreatePasswordHash(password, out byte[] passwordHash, out byte[] passwordSalt);
+
+                Account account = new Account
+                {
+                    Username = username,
+                    Email = email,
+                    PasswordHash = passwordHash,
+                    PasswordSalt = passwordSalt
+                };
+
+                await _server.Database.InsertAsync(account);
+                await _server.Database.UpdateAsync(account);
+
+                registered = true;
+            }
+
+            RegisterResponseBroadcast responseBroadcast = new RegisterResponseBroadcast
+            {
+                Registered = registered
             };
-            NetworkManager.ServerManager.Broadcast(conn, arb, false);
+
+            NetworkManager.Log("Sending Register response to client...");
+            NetworkManager.ServerManager.Broadcast(conn, responseBroadcast, false);
+
+            if (!registered)
+                return;
+
+            OnAuthenticationRequestBroadcast(conn, new AuthenticationRequestBroadcast
+            {
+                Username = rrb.Username,
+                Password = rrb.Password,
+                usr_pad_count = rrb.usr_pad_count,
+                pass_pad_count = rrb.pass_pad_count,
+            }, channel);
         }
 
-        /// <summary>
-        /// Sends an Handshake response to a connection.
-        /// </summary>
-        private void SendHandshakeResponse(NetworkConnection conn, HandshakeResponseBroadcast hrb)
+        private void OnHandshakeRequestBroadcast(NetworkConnection conn, HandshakeRequestBroadcast hsk, Channel channel)
         {
+            NetworkManager.Log("Received Handshake request from client...");
+            Span<byte> result = stackalloc byte[64 + 16];
+            byte[] data = new byte[64 + 16];
+            result.Clear();
+
+            NetworkManager.Log("Computing the SharedKey key based on the public key received from client...");
+            _crypto.ComputeShared(Transforms.InvertTransformValueArray(hsk.PublicKey).ToArray());
+
+            if (!_handshakeCompleted.TryAdd(conn.ClientId, true))
+                _handshakeCompleted[conn.ClientId] = true;
+
+            NetworkManager.Log("Sending Server Public Key as a response to the handshake request from client...");
+
+            Array.ConstrainedCopy(_crypto.GetRandomSalt(), 0, data, 0, 64);
+            Array.ConstrainedCopy(_crypto.GetIV(), 0, data, 64, 16);
+            result = new Span<byte>(data);
+
+            HandshakeResponseBroadcast hrb = new()
+            {
+                PublicKey = Transforms.TransformValueArray(_crypto.PublicKey).ToArray(),
+                Randombytes = Transforms.TransformValueArray(result.ToArray()).ToArray()
+            };
+
             NetworkManager.ServerManager.Broadcast(conn, hrb, false);
+            Array.Clear(data, 0, data.Length);
+        }
+
+        private async void OnAuthenticationRequestBroadcast(NetworkConnection conn, AuthenticationRequestBroadcast arb,
+            Channel channel)
+        {
+            if (!_handshakeCompleted.TryGetValue(conn.ClientId, out bool handshakeCompleted) || !handshakeCompleted)
+            {
+                NetworkManager.LogWarning("A Client tried to authenticate without previously completing handshaking.");
+                return;
+            }
+
+            if (conn.Authenticated)
+            {
+                conn.Disconnect(true);
+                NetworkManager.LogWarning("Client Disconnected. Reason: Already Authenticated.");
+                return;
+            }
+
+            NetworkManager.Log("Validating client details...");
+
+            string username = Encoding.UTF8.GetString(_crypto.DecryptData(arb.Username, arb.usr_pad_count));
+            string password = Encoding.UTF8.GetString(_crypto.DecryptData(arb.Password, arb.pass_pad_count));
+
+            Account existsAccount =
+                await _server.Database.FindAsync<Account>(x => x.Username == username);
+
+
+            bool authenticated = existsAccount != null &&
+                                 Hash.VerifyPasswordHash(password, existsAccount.PasswordHash,
+                                     existsAccount.PasswordSalt);
+
+
+            AuthenticationResponseBroadcast responseBroadcast = new()
+            {
+                Authenticated = authenticated
+            };
+
+            NetworkManager.Log("Sending Authentication response to client...");
+            NetworkManager.ServerManager.Broadcast(conn, responseBroadcast, false);
+
+            OnAuthenticationResult?.Invoke(conn, authenticated);
         }
     }
 }
